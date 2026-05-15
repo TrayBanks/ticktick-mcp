@@ -1,5 +1,5 @@
 """
-TickTick MCP Server - V2
+TickTick MCP Server - V2.1
 
 New in V2:
 - Sub-task support (add, complete, list sub-tasks)
@@ -7,6 +7,13 @@ New in V2:
 - Bulk operations (complete/delete/move multiple tasks at once)
 - Natural language date parsing ("next Friday", "tomorrow at 3pm")
 - Improved error messages
+
+New in V2.1:
+- Inbox support — auto-discovers and caches the hidden inbox project ID
+- list_projects now includes Inbox
+- get_project_tasks accepts "inbox" as a shorthand
+- get_smart_list now includes inbox tasks
+- New get_inbox_tasks tool for direct inbox access
 """
 
 import asyncio
@@ -28,6 +35,10 @@ load_dotenv()
 BASE_URL = "https://ticktick.com/open/v1"
 TOKEN_URL = "https://ticktick.com/oauth/token"
 TOKENS_FILE = Path(__file__).parent / ".tokens.json"
+INBOX_ID_FILE = Path(__file__).parent / ".inbox_id"
+
+# In-memory cache so we only probe once per server session
+_inbox_id_cache: str | None = None
 
 server = Server("ticktick")
 
@@ -167,6 +178,56 @@ async def _api(
             )
 
         return resp.json() if resp.content else None
+
+
+# ---------------------------------------------------------------------------
+# Inbox discovery
+# ---------------------------------------------------------------------------
+
+async def _get_inbox_id() -> str:
+    """
+    Return the user's inbox project ID.
+
+    TickTick's GET /project never includes the inbox, and the ID is
+    user-specific (pattern: inbox{userId}). We discover it once by
+    creating a probe task with no projectId, reading the returned
+    projectId, then immediately deleting the probe. The result is
+    cached in .inbox_id so subsequent calls are instant.
+    """
+    global _inbox_id_cache
+
+    # 1. In-memory cache (fastest)
+    if _inbox_id_cache:
+        return _inbox_id_cache
+
+    # 2. Disk cache
+    if INBOX_ID_FILE.exists():
+        _inbox_id_cache = INBOX_ID_FILE.read_text().strip()
+        return _inbox_id_cache
+
+    # 3. Probe the API
+    probe = await _api("POST", "/task", json_body={"title": "__inbox_probe__"})
+    inbox_id = probe.get("projectId", "")
+    if not inbox_id:
+        raise RuntimeError("Could not discover inbox project ID from TickTick API.")
+
+    # Clean up probe task immediately
+    try:
+        await _api("DELETE", f"/project/{inbox_id}/task/{probe['id']}")
+    except Exception:
+        pass  # Non-fatal — probe task will just sit in inbox
+
+    # Persist and cache
+    INBOX_ID_FILE.write_text(inbox_id)
+    _inbox_id_cache = inbox_id
+    return inbox_id
+
+
+async def _resolve_project_id(project_id: str) -> str:
+    """Resolve the string 'inbox' to the real inbox project ID."""
+    if project_id.lower() == "inbox":
+        return await _get_inbox_id()
+    return project_id
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +371,12 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["task_id", "project_id", "subtask_id"],
             },
         ),
+        # ── Inbox ─────────────────────────────────────────────────────────
+        types.Tool(
+            name="get_inbox_tasks",
+            description="Get all tasks in the TickTick Inbox (the default project for uncategorized tasks).",
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
         # ── Smart lists ───────────────────────────────────────────────────
         types.Tool(
             name="get_smart_list",
@@ -413,6 +480,7 @@ async def _dispatch(name: str, args: dict) -> Any:
         case "create_project":        return await _create_project(args)
         case "add_subtask":           return await _add_subtask(args["task_id"], args["project_id"], args["title"])
         case "complete_subtask":      return await _complete_subtask(args["task_id"], args["project_id"], args["subtask_id"])
+        case "get_inbox_tasks":       return await _get_inbox_tasks()
         case "get_smart_list":        return await _get_smart_list(args["list_name"])
         case "bulk_complete_tasks":   return await _bulk_complete_tasks(args["tasks"])
         case "bulk_delete_tasks":     return await _bulk_delete_tasks(args["tasks"])
@@ -425,21 +493,39 @@ async def _dispatch(name: str, args: dict) -> Any:
 # ---------------------------------------------------------------------------
 
 async def _list_projects() -> list[dict]:
-    return await _api("GET", "/project")
+    projects = await _api("GET", "/project")
+    inbox_id = await _get_inbox_id()
+    # Prepend inbox as the first entry — mirrors the TickTick UI
+    inbox_entry = {"id": inbox_id, "name": "Inbox", "sortOrder": -1, "kind": "TASK"}
+    return [inbox_entry] + (projects or [])
 
 
 async def _get_project_tasks(project_id: str) -> dict:
-    return await _api("GET", f"/project/{project_id}/data")
+    resolved = await _resolve_project_id(project_id)
+    return await _api("GET", f"/project/{resolved}/data")
+
+
+async def _get_inbox_tasks() -> dict:
+    inbox_id = await _get_inbox_id()
+    data = await _api("GET", f"/project/{inbox_id}/data")
+    tasks = data.get("tasks", []) if isinstance(data, dict) else []
+    return {
+        "projectId": inbox_id,
+        "projectName": "Inbox",
+        "count": len(tasks),
+        "tasks": tasks,
+    }
 
 
 async def _get_task(task_id: str, project_id: str) -> dict:
-    return await _api("GET", f"/task/{task_id}", params={"projectId": project_id})
+    resolved = await _resolve_project_id(project_id)
+    return await _api("GET", f"/task/{task_id}", params={"projectId": resolved})
 
 
 async def _create_task(args: dict) -> dict:
     body: dict = {"title": args["title"]}
     if "project_id" in args:
-        body["projectId"] = args["project_id"]
+        body["projectId"] = await _resolve_project_id(args["project_id"])
     if "content" in args:
         body["content"] = args["content"]
     if "due_date" in args:
@@ -458,7 +544,7 @@ async def _create_task(args: dict) -> dict:
 
 async def _update_task(args: dict) -> dict:
     task_id = args["task_id"]
-    project_id = args["project_id"]
+    project_id = await _resolve_project_id(args["project_id"])
     current = await _get_task(task_id, project_id)
 
     body: dict = {
@@ -479,12 +565,14 @@ async def _update_task(args: dict) -> dict:
 
 
 async def _complete_task(task_id: str, project_id: str) -> dict:
-    result = await _api("POST", f"/project/{project_id}/task/{task_id}/complete")
+    resolved = await _resolve_project_id(project_id)
+    result = await _api("POST", f"/project/{resolved}/task/{task_id}/complete")
     return result or {"status": "completed", "task_id": task_id}
 
 
 async def _delete_task(task_id: str, project_id: str) -> dict:
-    await _api("DELETE", f"/project/{project_id}/task/{task_id}")
+    resolved = await _resolve_project_id(project_id)
+    await _api("DELETE", f"/project/{resolved}/task/{task_id}")
     return {"status": "deleted", "task_id": task_id}
 
 
@@ -551,12 +639,14 @@ async def _get_smart_list(list_name: str) -> dict:
     else:
         raise ValueError(f"Unknown list '{list_name}'. Use 'today', 'tomorrow', or 'this_week'.")
 
+    # list_projects already includes inbox as the first entry
     projects = await _list_projects()
     matched: list[dict] = []
 
     async def fetch(project: dict):
         try:
-            data = await _get_project_tasks(project["id"])
+            # Use the real ID directly — already resolved by list_projects
+            data = await _api("GET", f"/project/{project['id']}/data")
             tasks = data.get("tasks", []) if isinstance(data, dict) else []
             for task in tasks:
                 if task.get("status", 0) == 0 and _in_date_range(task, start, end):
